@@ -52,7 +52,8 @@ T sigmoid(T x)
 template <typename Tgpu, typename Tcheck>
 int mloGLUForwardContiguousDim0RunHost(const Tgpu* input,
                                        miopenTensorDescriptor_t outputDesc,
-                                       Tcheck* outputHost)
+                                       Tcheck* outputHost,
+                                       bool parallel)
 {
     auto output_numel    = miopen::deref(outputDesc).GetElementSize();
     auto inputFirstHalf  = input;
@@ -60,12 +61,25 @@ int mloGLUForwardContiguousDim0RunHost(const Tgpu* input,
 
     int ret = 0;
 
-    par_for(output_numel, 1<<17, [&](const size_t& o){
-        Tcheck valA   = static_cast<Tcheck>(inputFirstHalf[o]);
-        Tcheck valB   = static_cast<Tcheck>(inputSecondHalf[o]);
-        Tcheck val    = valA * sigmoid(valB);
-        outputHost[o] = val;
-    });
+    if(parallel)
+    {
+        par_for(output_numel, [&](const size_t& o) {
+            Tcheck valA   = static_cast<Tcheck>(inputFirstHalf[o]);
+            Tcheck valB   = static_cast<Tcheck>(inputSecondHalf[o]);
+            Tcheck val    = valA * sigmoid(valB);
+            outputHost[o] = val;
+        });
+    }
+    else
+    {
+        for(size_t o = 0; o < output_numel; ++o)
+        {
+            Tcheck valA   = static_cast<Tcheck>(inputFirstHalf[o]);
+            Tcheck valB   = static_cast<Tcheck>(inputSecondHalf[o]);
+            Tcheck val    = valA * sigmoid(valB);
+            outputHost[o] = val;
+        }
+    }
 
     return ret;
 }
@@ -74,7 +88,8 @@ template <typename Tgpu, typename Tcheck>
 int mloGLUBackwardCongiguousDim0RunHost(const Tgpu* input,
                                         miopenTensorDescriptor_t outputGradDesc,
                                         const Tgpu* outputGrad,
-                                        Tcheck* inputGradHost)
+                                        Tcheck* inputGradHost,
+                                        bool parallel)
 {
     int ret = 0;
 
@@ -84,15 +99,29 @@ int mloGLUBackwardCongiguousDim0RunHost(const Tgpu* input,
     auto inputFistHalf_grad   = inputGradHost;
     auto inputSecondHalf_grad = inputGradHost + outputGrad_numel;
 
-    par_for(outputGrad_numel, 1<<17, [&](const auto& o)
+    if(parallel)
     {
-        Tcheck inputFirstHalf_v = static_cast<Tcheck>(inputFirstHalf[o]);
-        Tcheck sigmoid_v        = sigmoid(static_cast<Tcheck>(inputSecondHalf[o]));
-        Tcheck grad_v           = static_cast<Tcheck>(outputGrad[o]);
+        par_for(outputGrad_numel, [&](const auto& o) {
+            Tcheck inputFirstHalf_v = static_cast<Tcheck>(inputFirstHalf[o]);
+            Tcheck sigmoid_v        = sigmoid(static_cast<Tcheck>(inputSecondHalf[o]));
+            Tcheck grad_v           = static_cast<Tcheck>(outputGrad[o]);
 
-        inputFistHalf_grad[o]   = sigmoid_v * grad_v;
-        inputSecondHalf_grad[o] = (1 - sigmoid_v) * sigmoid_v * grad_v * inputFirstHalf_v;
-    });
+            inputFistHalf_grad[o]   = sigmoid_v * grad_v;
+            inputSecondHalf_grad[o] = (1 - sigmoid_v) * sigmoid_v * grad_v * inputFirstHalf_v;
+        });
+    }
+    else
+    {
+        for(size_t o = 0; o < outputGrad_numel; ++o)
+        {
+            Tcheck inputFirstHalf_v = static_cast<Tcheck>(inputFirstHalf[o]);
+            Tcheck sigmoid_v        = sigmoid(static_cast<Tcheck>(inputSecondHalf[o]));
+            Tcheck grad_v           = static_cast<Tcheck>(outputGrad[o]);
+
+            inputFistHalf_grad[o]   = sigmoid_v * grad_v;
+            inputSecondHalf_grad[o] = (1 - sigmoid_v) * sigmoid_v * grad_v * inputFirstHalf_v;
+        }
+    }
 
     return ret;
 }
@@ -159,6 +188,7 @@ private:
     std::vector<Tgpu> in;
     std::vector<Tgpu> out;
     std::vector<Tref> outhost;
+    std::vector<Tref> outhost_another;
 
     std::vector<Tgpu> inGrad;
     std::vector<Tgpu> outGrad;
@@ -265,7 +295,8 @@ int GLUDriver<Tgpu, Tref>::AllocateBuffersAndCopy()
         out = std::vector<Tgpu>(out_sz, static_cast<Tgpu>(0));
 
         // CPU allocation
-        outhost = std::vector<Tref>(out_sz, static_cast<Tref>(0));
+        outhost         = std::vector<Tref>(out_sz, static_cast<Tref>(0));
+        outhost_another = std::vector<Tref>(out_sz, static_cast<Tref>(0));
 
         for(int i = 0; i < in_sz; i++)
         {
@@ -298,8 +329,9 @@ int GLUDriver<Tgpu, Tref>::AllocateBuffersAndCopy()
         outGrad = std::vector<Tgpu>(outGrad_sz, static_cast<Tgpu>(0));
 
         // CPU allocation
-        outhost    = std::vector<Tref>(out_sz, static_cast<Tref>(0));
-        inGradhost = std::vector<Tref>(inGrad_sz, static_cast<Tref>(0));
+        outhost         = std::vector<Tref>(out_sz, static_cast<Tref>(0));
+        outhost_another = std::vector<Tref>(out_sz, static_cast<Tref>(0));
+        inGradhost      = std::vector<Tref>(inGrad_sz, static_cast<Tref>(0));
 
         for(int i = 0; i < in_sz; i++)
         {
@@ -371,9 +403,71 @@ template <typename Tgpu, typename Tref>
 int GLUDriver<Tgpu, Tref>::RunForwardCPU()
 {
     MIOPEN_THROW_IF(dim != 0, "This driver only supports dim = 0");
-    mloGLUForwardContiguousDim0RunHost<Tgpu, Tref>(in.data(), outputTensor, outhost.data());
 
-    return miopenStatusSuccess;
+    auto solver = [&] {
+        mloGLUForwardContiguousDim0RunHost<Tgpu, Tref>(
+            in.data(), outputTensor, outhost.data(), false);
+    };
+
+    auto solverPar = [&] {
+        mloGLUForwardContiguousDim0RunHost<Tgpu, Tref>(
+            in.data(), outputTensor, outhost_another.data(), true);
+    };
+    Timer t;
+    int runs = 50;
+
+    double total_serial   = 0.0;
+    double total_parallel = 0.0;
+
+    // warmup both once
+    solver();
+    solverPar();
+
+    auto error = miopen::rms_range(outhost, outhost_another);
+    const double tolerance =
+        ((sizeof(Tref) == 4) ? static_cast<double>(1e-6) : static_cast<double>(7e-2));
+    if(!std::isfinite(error) || error > tolerance)
+    {
+        std::cout << std::string("Forward GEMM FAILED: ") << error << std::endl;
+    }
+    else
+    {
+        printf("Forward GEMM Verifies serial and parallel (err=%f)\n", error);
+    }
+
+    for(int i = 0; i < runs; ++i)
+    {
+        // randomize order each iteration
+        if(i & 1)
+        {
+            t.start();
+            solverPar();
+            t.stop();
+            total_parallel += t.gettime_ms();
+
+            t.start();
+            solver();
+            t.stop();
+            total_serial += t.gettime_ms();
+        }
+        else
+        {
+            t.start();
+            solver();
+            t.stop();
+            total_serial += t.gettime_ms();
+
+            t.start();
+            solverPar();
+            t.stop();
+            total_parallel += t.gettime_ms();
+        }
+    }
+
+    printf("serial:   %.3f ms\n", total_serial / runs);
+    printf("parallel: %.3f ms\n", total_parallel / runs);
+
+    return 0;
 }
 
 template <typename Tgpu, typename Tref>
@@ -454,10 +548,71 @@ template <typename Tgpu, typename Tref>
 int GLUDriver<Tgpu, Tref>::RunBackwardCPU()
 {
     MIOPEN_THROW_IF(dim != 0, "This driver only supports dim = 0");
-    mloGLUBackwardCongiguousDim0RunHost<Tgpu, Tref>(
-        in.data(), outputTensorGrad, outGrad.data(), inGradhost.data());
 
-    return miopenStatusSuccess;
+    auto solver = [&] {
+        mloGLUBackwardCongiguousDim0RunHost<Tgpu, Tref>(
+            in.data(), outputTensorGrad, outGrad.data(), inGradhost.data(), false);
+    };
+
+    auto solverPar = [&] {
+        mloGLUBackwardCongiguousDim0RunHost<Tgpu, Tref>(
+            in.data(), outputTensorGrad, outGrad.data(), inGradhost.data(), true);
+    };
+    Timer t;
+    int runs = 50;
+
+    double total_serial   = 0.0;
+    double total_parallel = 0.0;
+
+    // warmup both once
+    solver();
+    solverPar();
+
+    auto error = miopen::rms_range(outhost, out);
+    const double tolerance =
+        ((sizeof(Tref) == 4) ? static_cast<double>(1e-6) : static_cast<double>(7e-2));
+    if(!std::isfinite(error) || error > tolerance)
+    {
+        std::cout << std::string("Backward GEMM FAILED: ") << error << std::endl;
+    }
+    else
+    {
+        printf("Backward GEMM Verifies serial and parallel (err=%f)\n", error);
+    }
+
+    for(int i = 0; i < runs; ++i)
+    {
+        // randomize order each iteration
+        if(i & 1)
+        {
+            t.start();
+            solverPar();
+            t.stop();
+            total_parallel += t.gettime_ms();
+
+            t.start();
+            solver();
+            t.stop();
+            total_serial += t.gettime_ms();
+        }
+        else
+        {
+            t.start();
+            solver();
+            t.stop();
+            total_serial += t.gettime_ms();
+
+            t.start();
+            solverPar();
+            t.stop();
+            total_parallel += t.gettime_ms();
+        }
+    }
+
+    printf("serial:   %.3f ms\n", total_serial / runs);
+    printf("parallel: %.3f ms\n", total_parallel / runs);
+
+    return 0;
 }
 
 template <typename Tgpu, typename Tref>
